@@ -1,40 +1,82 @@
 name: Deploy to Cloudflare Workers
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-      - 'LICENSE'
+  # 手动触发部署
   workflow_dispatch:
+
+  # 上游同步工作流完成后触发检查
+  workflow_run:
+    workflows: ["Upstream Sync"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
       should_deploy: ${{ steps.decide.outputs.should_deploy }}
+      deploy_ref: ${{ steps.decide.outputs.deploy_ref }}
+
     steps:
-      - id: decide
-        run: |
-          if [ -n "$CF_ACCOUNT_ID" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "should_deploy=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_deploy=false" >> $GITHUB_OUTPUT
-          fi
+      - name: Check whether deployment is needed
+        id: decide
+        uses: actions/github-script@v7
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          EVENT_NAME: ${{ github.event_name }}
+        with:
+          script: |
+            core.setOutput('should_deploy', 'false');
+
+            // 保留原有逻辑：手动运行允许部署，
+            // 自动运行需要配置 CF_ACCOUNT_ID。
+            if (!process.env.CF_ACCOUNT_ID &&
+                context.eventName !== 'workflow_dispatch') {
+              core.info('未配置 CF_ACCOUNT_ID，跳过部署');
+              return;
+            }
+
+            let deployRef = context.sha;
+
+            if (context.eventName === 'workflow_run') {
+              const run = context.payload.workflow_run;
+
+              if (run.conclusion !== 'success') {
+                core.info('上游同步未成功，跳过部署');
+                return;
+              }
+
+              const { data } = await github.rest.repos.getBranch({
+                ...context.repo,
+                branch: 'main'
+              });
+
+              // 同步工作流启动时的提交号，与同步完成后的 main 比较。
+              if (data.commit.sha === run.head_sha) {
+                core.info('没有新更新，跳过部署');
+                return;
+              }
+
+              deployRef = data.commit.sha;
+            }
+
+            core.setOutput('deploy_ref', deployRef);
+            core.setOutput('should_deploy', 'true');
+            core.info(`准备部署提交：${deployRef}`);
 
   deploy:
     needs: check
     if: needs.check.outputs.should_deploy == 'true'
     runs-on: ubuntu-latest
     name: Deploy
+
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.deploy_ref }}
 
       - name: 🔧 Setup Node.js
         uses: actions/setup-node@v4
@@ -56,8 +98,8 @@ jobs:
           compatibility_flags = ["nodejs_compat"]
 
           # 定时任务配置（UTC）
-          # - 每分钟：执行离线节点检测
-          # - 每小时：合并执行其他定时任务（每月1号数据清理、每月8号清理旧表、每天12点服务器到期检测）
+          # 每分钟：执行离线节点检测
+          # 每小时：执行其他定时任务
           [triggers]
           crons = ["*/1 * * * *", "0 * * * *"]
 
@@ -70,7 +112,6 @@ jobs:
           database_name = "server-monitor-db"
           database_id = "D1_PLACEHOLDER"
 
-          # Durable Objects：实时指标广播中心
           [[durable_objects.bindings]]
           name = "METRICS_BROADCASTER"
           class_name = "MetricsBroadcaster"
@@ -85,7 +126,6 @@ jobs:
           CORS_ALLOWED_ORIGINS = "CORS_ORIGINS_PLACEHOLDER"
           WEOF
 
-          # 替换占位符
           sed -i "s|D1_PLACEHOLDER|${{ secrets.D1_DATABASE_ID }}|g" wrangler.toml
           sed -i "s|SECRET_PLACEHOLDER|${{ secrets.API_SECRET }}|g" wrangler.toml
           sed -i "s|USER_NAME_PLACEHOLDER|${{ secrets.API_USER_NAME }}|g" wrangler.toml
@@ -93,9 +133,6 @@ jobs:
 
           echo "✅ wrangler.toml 已生成"
 
-      # wrangler v4 的 `deploy` 会自动根据 wrangler.toml 中的 [[durable_objects.bindings]]
-      # 声明创建 DO namespace（幂等：已存在则跳过），无需单独命令。
-      # 前提：MetricsBroadcaster 类必须从 index.js 导出（已通过 src/index.js 实现）。
       - name: 🚀 Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
@@ -106,14 +143,8 @@ jobs:
 
       - name: ✅ Deployment Success
         if: success()
-        run: |
-          echo "============================================"
-          echo "  🎉 部署成功！"
-          echo "============================================"
+        run: echo "🎉 部署成功！"
 
       - name: ❌ Deployment Failed
         if: failure()
-        run: |
-          echo "============================================"
-          echo "  💥 部署失败！请检查 Actions 日志"
-          echo "============================================"
+        run: echo "💥 部署失败！请检查 Actions 日志"
